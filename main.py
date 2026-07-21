@@ -40,6 +40,7 @@ from todus import util
 from cmd import handle_start
 from cmd.yt import handle_yt, handle_yt_help
 from cmd.ds import handle_ds, handle_ds_help
+from handlers.media import MediaHandler
 
 # Importar Flask
 from flask import Flask, jsonify, request
