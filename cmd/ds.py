@@ -3,11 +3,7 @@
 
 """
 Comando para interactuar con DeepSeek AI en ToDus.
-Flujo optimizado:
-1. Mensaje inicial: "🤔 Pensando..."
-2. Se muestra el pensamiento (think) cuando llega
-3. La respuesta (response) se edita con CADA fragmento que llega
-4. Al recibir 'done', se muestra el mensaje final completo
+Optimizado: edita solo cuando hay cambios significativos en el texto.
 """
 
 import re
@@ -21,20 +17,17 @@ from datetime import datetime
 logger = logging.getLogger(__name__)
 
 # ============================================================
-# CONFIGURACIÓN DE LA API
+# CONFIGURACIÓN
 # ============================================================
 
 API_URL = "https://ds-flaskapi.onrender.com"
 TIMEOUT = 120
-VERSION = "1.0.0"
 
 # ============================================================
-# CLIENTE DEEPSEEK INTEGRADO
+# CLIENTE DEEPSEEK
 # ============================================================
 
 class DeepSeekClient:
-    """Cliente para interactuar con la API de DeepSeek."""
-    
     def __init__(self, api_url: str = API_URL, timeout: int = TIMEOUT):
         self.api_url = api_url.rstrip('/')
         self.timeout = timeout
@@ -48,7 +41,6 @@ class DeepSeekClient:
         logger.info(f"Cliente DeepSeek inicializado con API: {self.api_url}")
     
     def create_session(self) -> str:
-        """Crea una nueva sesión de chat."""
         try:
             logger.debug("Creando nueva sesión...")
             resp = requests.post(
@@ -75,7 +67,6 @@ class DeepSeekClient:
             raise
     
     def reset_session(self) -> str:
-        """Reinicia la sesión actual."""
         logger.info("Reiniciando sesión...")
         self.session_id = None
         self.parent_id = None
@@ -83,12 +74,10 @@ class DeepSeekClient:
         return self.create_session()
     
     def set_thinking(self, enabled: bool):
-        """Activa o desactiva el pensamiento profundo."""
         self.thinking_enabled = enabled
         logger.debug(f"DeepThink {'activado' if enabled else 'desactivado'}")
     
     def set_search(self, enabled: bool):
-        """Activa o desactiva la búsqueda inteligente."""
         self.search_enabled = enabled
         logger.debug(f"Búsqueda {'activada' if enabled else 'desactivada'}")
     
@@ -99,16 +88,6 @@ class DeepSeekClient:
         parent_id: Optional[int] = None,
         stream: bool = True
     ) -> Generator[Tuple[str, str, Optional[int]], None, None]:
-        """
-        Envía un mensaje y devuelve un generador de eventos.
-        
-        Yields:
-            (tipo, contenido, message_id)
-            - 'think': fragmento de pensamiento
-            - 'response': fragmento de respuesta
-            - 'done': mensaje completado
-            - 'error': error
-        """
         if not self.session_id:
             raise Exception("Primero debes crear una sesión con create_session()")
         
@@ -165,14 +144,12 @@ class DeepSeekClient:
                         
                         if event_type == 'think':
                             think_text = str(data)
-                            # Eliminar "FINISHED"
                             think_text = re.sub(r'\s*FINISHED\s*', '', think_text, flags=re.IGNORECASE)
                             think_full.append(think_text)
                             yield ('think', think_text, None)
                         
                         elif event_type == 'response':
                             response_text = str(data)
-                            # Eliminar "FINISHED"
                             response_text = re.sub(r'\s*FINISHED\s*', '', response_text, flags=re.IGNORECASE)
                             response_full.append(response_text)
                             yield ('response', response_text, None)
@@ -187,7 +164,6 @@ class DeepSeekClient:
                             yield ('error', str(data), None)
                             return
                 
-                # Si no se recibió 'done', pero hay datos, enviar como done
                 if not done_id and (think_full or response_full):
                     yield ('done', None, None)
                     
@@ -202,7 +178,6 @@ class DeepSeekClient:
             yield ('error', f'Error inesperado: {str(e)}', None)
     
     def get_status(self) -> Dict:
-        """Devuelve el estado actual del cliente."""
         return {
             "api_url": self.api_url,
             "session_id": self.session_id,
@@ -211,56 +186,67 @@ class DeepSeekClient:
             "search_enabled": self.search_enabled,
             "session_created_at": self.session_created_at.isoformat() if self.session_created_at else None,
             "message_count": len(self.conversation_history),
-            "version": VERSION
+            "version": "1.0.0"
         }
 
 # ============================================================
-# PROMPT DEL SISTEMA
+# PROCESAMIENTO DE TEXTO
 # ============================================================
 
-SYSTEM_PROMPT = """Eres AIDUS, una asistente de inteligencia artificial creada para ayudar en ToDus.
+def clean_markdown(text: str) -> str:
+    if not text:
+        return ""
+    text = re.sub(r'\s*FINISHED\s*', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'```[a-zA-Z]*\n.*?```', '', text, flags=re.DOTALL)
+    text = re.sub(r'`[^`]*`', '', text)
+    text = re.sub(r' +', ' ', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
 
-REGLAS OBLIGATORIAS:
-1. NUNCA generes código en ningún lenguaje de programación (Python, JavaScript, etc.)
-2. NUNCA generes pseudocódigo ni algoritmos en formato código
-3. Tus respuestas deben ser PREFERIBLEMENTE CORTAS y EFICIENTES
-4. NUNCA des datos falsos o inventados
-5. Si algo es ambiguo o no lo sabes, PREGUNTA a qué se refiere el usuario
-6. No uses listas numeradas extensas, prefiere texto fluido
-7. Usa formato Markdown básico: **negrita**, *cursiva*, > citas, --- separadores
-8. Sé amable y directa en tus respuestas
 
-CARACTERÍSTICAS SIEMPRE ACTIVAS:
-- Búsqueda web para información actualizada
-- Pensamiento profundo para análisis complejos
-
-RESPONDE SIEMPRE EN ESPAÑOL."""
+def format_for_todus(text: str) -> str:
+    if not text:
+        return ""
+    text = clean_markdown(text)
+    text = re.sub(r'^\s*\*\s+', '+ ', text, flags=re.MULTILINE)
+    text = re.sub(r'^\s*-\s+', '+ ', text, flags=re.MULTILINE)
+    text = re.sub(r'^\s*\d+\.\s+', '+ ', text, flags=re.MULTILINE)
+    
+    lines = text.split('\n')
+    formatted_lines = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            formatted_lines.append('')
+        elif line.startswith('# '):
+            formatted_lines.append(f'**{line[2:]}**')
+        elif line.startswith('## '):
+            formatted_lines.append(f'**{line[3:]}**')
+        elif line.startswith('### '):
+            formatted_lines.append(f'*{line[4:]}*')
+        else:
+            formatted_lines.append(line)
+    return '\n'.join(formatted_lines)
 
 # ============================================================
 # GESTOR DE SESIONES
 # ============================================================
 
 class SessionManager:
-    """Gestiona sesiones de DeepSeek por usuario."""
-    
     def __init__(self):
         self.sessions: Dict[str, Dict] = {}
         self.clients: Dict[str, DeepSeekClient] = {}
     
     def get_or_create_session(self, user_id: str) -> Dict:
-        """Obtiene la sesión de un usuario, crea una nueva si no existe."""
         if user_id not in self.sessions:
             return self.create_session(user_id)
         return self.sessions[user_id]
     
     def create_session(self, user_id: str) -> Dict:
-        """Crea una nueva sesión para un usuario."""
         logger.info(f"🆕 Creando sesión DeepSeek para {user_id}")
         
         client = DeepSeekClient()
         session_id = client.create_session()
-        
-        # DeepThink y búsqueda SIEMPRE activos
         client.set_thinking(True)
         client.set_search(True)
         
@@ -276,7 +262,6 @@ class SessionManager:
         return self.sessions[user_id]
     
     def reset_session(self, user_id: str) -> Dict:
-        """Reinicia la sesión de un usuario."""
         if user_id in self.clients:
             client = self.clients[user_id]
             client.reset_session()
@@ -287,147 +272,13 @@ class SessionManager:
             logger.info(f"🔄 Sesión reiniciada para {user_id}")
         else:
             return self.create_session(user_id)
-        
         return self.sessions[user_id]
     
     def get_client(self, user_id: str) -> Optional[DeepSeekClient]:
-        """Obtiene el cliente de un usuario."""
         return self.clients.get(user_id)
 
 # ============================================================
-# PROCESAMIENTO DE TEXTO PARA TODUS
-# ============================================================
-
-def clean_markdown(text: str) -> str:
-    """Limpia Markdown para ToDus."""
-    if not text:
-        return ""
-    
-    # Eliminar "FINISHED"
-    text = re.sub(r'\s*FINISHED\s*', '', text, flags=re.IGNORECASE)
-    
-    # Eliminar bloques de código
-    text = re.sub(r'```[a-zA-Z]*\n.*?```', '', text, flags=re.DOTALL)
-    text = re.sub(r'`[^`]*`', '', text)
-    
-    # Limpiar espacios
-    text = re.sub(r' +', ' ', text)
-    text = re.sub(r'\n{3,}', '\n\n', text)
-    
-    return text.strip()
-
-
-def format_for_todus(text: str) -> str:
-    """Formatea texto para ToDus con Markdown básico."""
-    if not text:
-        return ""
-    
-    text = clean_markdown(text)
-    
-    # Convertir listas * a +
-    text = re.sub(r'^\s*\*\s+', '+ ', text, flags=re.MULTILINE)
-    text = re.sub(r'^\s*-\s+', '+ ', text, flags=re.MULTILINE)
-    text = re.sub(r'^\s*\d+\.\s+', '+ ', text, flags=re.MULTILINE)
-    
-    # Convertir # a negrita
-    lines = text.split('\n')
-    formatted_lines = []
-    for line in lines:
-        line = line.strip()
-        if not line:
-            formatted_lines.append('')
-        elif line.startswith('# '):
-            formatted_lines.append(f'**{line[2:]}**')
-        elif line.startswith('## '):
-            formatted_lines.append(f'**{line[3:]}**')
-        elif line.startswith('### '):
-            formatted_lines.append(f'*{line[4:]}*')
-        else:
-            formatted_lines.append(line)
-    
-    return '\n'.join(formatted_lines)
-
-# ============================================================
-# ACTUALIZACIÓN DE MENSAJES
-# ============================================================
-
-def build_message(response_text: str, think_text: str = "", 
-                  has_think: bool = False, is_done: bool = False) -> str:
-    """
-    Construye el mensaje formateado para ToDus.
-    """
-    # Formatear textos
-    response_text = format_for_todus(response_text) if response_text else ""
-    think_text = clean_markdown(think_text) if think_text else ""
-    
-    # Limitar pensamiento si es muy largo
-    if len(think_text) > 300:
-        think_text = think_text[:297] + "..."
-    
-    # Construir mensaje según el estado
-    if is_done:
-        # Mensaje final completo
-        if has_think and think_text:
-            message = (
-                f"**🧠 Pensamiento:**\n"
-                f"> {think_text}\n\n"
-                f"---\n\n"
-                f"**💬 Respuesta:**\n\n"
-                f"{response_text}\n\n"
-                f"---\n\n"
-                f"*✅ Respuesta completa*"
-            )
-        else:
-            message = (
-                f"**💬 Respuesta:**\n\n"
-                f"{response_text}\n\n"
-                f"---\n\n"
-                f"*✅ Respuesta completa*"
-            )
-    elif has_think and think_text:
-        # Mostrando pensamiento + respuesta en progreso
-        message = (
-            f"**🧠 Pensando...**\n"
-            f"> {think_text}\n\n"
-            f"---\n\n"
-            f"**💬 Respondiendo:**\n\n"
-            f"{response_text}\n\n"
-            f"*⏳ Generando...*"
-        )
-    elif response_text:
-        # Solo respuesta en progreso (sin pensamiento visible)
-        message = (
-            f"**💬 Respondiendo:**\n\n"
-            f"{response_text}\n\n"
-            f"*⏳ Generando...*"
-        )
-    else:
-        # Estado inicial: solo pensando
-        message = "🤔 **Pensando...**"
-    
-    # Limitar longitud máxima
-    if len(message) > 4000:
-        message = message[:3997] + "..."
-    
-    return message
-
-
-def update_message(client, to_phone: str, msg_id: str, 
-                   response_text: str, think_text: str = "",
-                   has_think: bool = False, is_done: bool = False):
-    """
-    Actualiza el mensaje con el contenido actual.
-    Se llama CADA VEZ que llega un fragmento nuevo.
-    """
-    message = build_message(response_text, think_text, has_think, is_done)
-    
-    try:
-        client.edit_message(to_phone, message, msg_id)
-    except Exception as e:
-        logger.error(f"❌ Error actualizando mensaje: {e}")
-
-# ============================================================
-# GESTOR GLOBAL DE SESIONES
+# GESTOR GLOBAL
 # ============================================================
 
 session_manager = SessionManager()
@@ -437,15 +288,7 @@ session_manager = SessionManager()
 # ============================================================
 
 def handle_ds(client, message: dict):
-    """
-    Maneja el comando 'ds' - Chat con DeepSeek AI.
-    
-    FLUJO OPTIMIZADO:
-    1. Mensaje inicial: "🤔 Pensando..."
-    2. CADA fragmento de 'think' actualiza el mensaje
-    3. CADA fragmento de 'response' actualiza el mensaje
-    4. 'done' muestra el mensaje final completo
-    """
+    """Maneja el comando 'ds' - Chat con DeepSeek AI."""
     sender = message.get('from')
     if not sender:
         return
@@ -453,13 +296,12 @@ def handle_ds(client, message: dict):
     sender_phone = sender.split('@')[0]
     body = message.get('body', '').strip()
     
-    # Extraer comando y mensaje
     parts = body.split(maxsplit=1)
     command = parts[0].lower() if parts else ""
     prompt = parts[1] if len(parts) > 1 else ""
     
     # ============================================================
-    # COMANDOS ESPECIALES (solo con /)
+    # COMANDOS ESPECIALES
     # ============================================================
     
     if command == '/new':
@@ -498,15 +340,10 @@ def handle_ds(client, message: dict):
             f"• `ds ¿Cuál es la capital de Francia?`\n"
             f"• `ds ¿Cómo está el clima hoy?`\n"
             f"• `ds Explícame qué es la IA`\n\n"
-            f"*🔧 La sesión se mantiene activa hasta que la reinicies*\n"
-            f"*📝 AIDUS nunca genera código y siempre responde en español*"
+            f"*🔧 La sesión se mantiene activa hasta que la reinicies*"
         )
         client.send_message(sender_phone, help_msg)
         return
-    
-    # ============================================================
-    # SI EMPIEZA CON / PERO NO ES COMANDO VÁLIDO
-    # ============================================================
     
     if command.startswith('/'):
         client.send_message(
@@ -516,10 +353,6 @@ def handle_ds(client, message: dict):
             f"*Para preguntar algo, solo escribe `ds <mensaje>`*"
         )
         return
-    
-    # ============================================================
-    # SI NO HAY MENSAJE
-    # ============================================================
     
     if not prompt:
         help_msg = (
@@ -531,10 +364,9 @@ def handle_ds(client, message: dict):
         return
     
     # ============================================================
-    # PROCESAR PREGUNTA NORMAL
+    # PROCESAR PREGUNTA
     # ============================================================
     
-    # Obtener o crear sesión
     session_manager.get_or_create_session(sender_phone)
     ds_client = session_manager.get_client(sender_phone)
     
@@ -543,56 +375,119 @@ def handle_ds(client, message: dict):
         return
     
     try:
-        # 1. Mensaje inicial: "🤔 Pensando..."
+        # 1. Mensaje inicial
         msg_id = client.send_message(sender_phone, "🤔 **Pensando...**")
         
-        # Variables de streaming
-        full_response = ""
+        # 2. Variables de streaming
         full_think = ""
+        full_response = ""
         has_think = False
-        fragment_count = 0
+        last_edit_time = time.time()
+        last_response_len = 0
+        last_think_len = 0
         
-        # 2. Procesar eventos de DeepSeek
+        # 3. Procesar eventos
         for event_type, content, msg_id_ds in ds_client.send_message(prompt):
-            fragment_count += 1
-            
             if event_type == 'think':
                 full_think += content
                 has_think = True
-                # ✅ ACTUALIZAR INMEDIATAMENTE con el fragmento de pensamiento
-                update_message(
-                    client, sender_phone, msg_id,
-                    full_response, full_think,
-                    has_think=has_think,
-                    is_done=False
-                )
+                
+                # Solo editar si hay cambios significativos en el pensamiento
+                if len(full_think) - last_think_len >= 30 or time.time() - last_edit_time >= 1.0:
+                    # Construir mensaje con pensamiento
+                    think_display = full_think[:300] + "..." if len(full_think) > 300 else full_think
+                    think_display = clean_markdown(think_display)
+                    
+                    message_text = (
+                        f"**🧠 Pensando...**\n"
+                        f"> {think_display}\n\n"
+                        f"---\n\n"
+                        f"**💬 Respondiendo:**\n\n"
+                        f"{format_for_todus(full_response)}\n\n"
+                        f"*⏳ Generando...*"
+                    )
+                    
+                    if len(message_text) > 4000:
+                        message_text = message_text[:3997] + "..."
+                    
+                    try:
+                        client.edit_message(sender_phone, message_text, msg_id)
+                        last_edit_time = time.time()
+                        last_think_len = len(full_think)
+                    except Exception as e:
+                        logger.error(f"Error editando mensaje: {e}")
             
             elif event_type == 'response':
                 full_response += content
-                # ✅ ACTUALIZAR INMEDIATAMENTE con el fragmento de respuesta
-                update_message(
-                    client, sender_phone, msg_id,
-                    full_response, full_think,
-                    has_think=has_think,
-                    is_done=False
-                )
+                
+                # Solo editar si hay cambios significativos
+                if len(full_response) - last_response_len >= 30 or time.time() - last_edit_time >= 1.0:
+                    # Construir mensaje con respuesta
+                    if has_think and full_think:
+                        think_display = full_think[:300] + "..." if len(full_think) > 300 else full_think
+                        think_display = clean_markdown(think_display)
+                        message_text = (
+                            f"**🧠 Pensando...**\n"
+                            f"> {think_display}\n\n"
+                            f"---\n\n"
+                            f"**💬 Respondiendo:**\n\n"
+                            f"{format_for_todus(full_response)}\n\n"
+                            f"*⏳ Generando...*"
+                        )
+                    else:
+                        message_text = (
+                            f"**💬 Respondiendo:**\n\n"
+                            f"{format_for_todus(full_response)}\n\n"
+                            f"*⏳ Generando...*"
+                        )
+                    
+                    if len(message_text) > 4000:
+                        message_text = message_text[:3997] + "..."
+                    
+                    try:
+                        client.edit_message(sender_phone, message_text, msg_id)
+                        last_edit_time = time.time()
+                        last_response_len = len(full_response)
+                    except Exception as e:
+                        logger.error(f"Error editando mensaje: {e}")
             
             elif event_type == 'done':
-                # ✅ Mensaje final completo
-                update_message(
-                    client, sender_phone, msg_id,
-                    full_response, full_think,
-                    has_think=has_think,
-                    is_done=True
-                )
+                # Mensaje final
+                if has_think and full_think:
+                    think_display = clean_markdown(full_think)
+                    if len(think_display) > 300:
+                        think_display = think_display[:297] + "..."
+                    
+                    final_message = (
+                        f"**🧠 Pensamiento:**\n"
+                        f"> {think_display}\n\n"
+                        f"---\n\n"
+                        f"**💬 Respuesta:**\n\n"
+                        f"{format_for_todus(full_response)}\n\n"
+                        f"---\n\n"
+                        f"*✅ Respuesta completa*"
+                    )
+                else:
+                    final_message = (
+                        f"**💬 Respuesta:**\n\n"
+                        f"{format_for_todus(full_response)}\n\n"
+                        f"---\n\n"
+                        f"*✅ Respuesta completa*"
+                    )
+                
+                if len(final_message) > 4000:
+                    final_message = final_message[:3997] + "..."
+                
+                try:
+                    client.edit_message(sender_phone, final_message, msg_id)
+                except Exception as e:
+                    logger.error(f"Error editando mensaje final: {e}")
                 break
             
             elif event_type == 'error':
                 client.send_message(
                     sender_phone,
-                    f"**❌ Error en AIDUS**\n\n"
-                    f"{content}\n\n"
-                    f"*Usa `/new` para reiniciar la sesión.*"
+                    f"**❌ Error en AIDUS**\n\n{content}\n\n*Usa `/new` para reiniciar la sesión.*"
                 )
                 return
         
@@ -602,16 +497,17 @@ def handle_ds(client, message: dict):
             session['message_count'] = session.get('message_count', 0) + 1
             session['last_message'] = prompt
         
-        logger.info(f"✅ Mensaje procesado para {sender_phone}: {len(full_response)} caracteres, {fragment_count} fragmentos")
+        logger.info(f"✅ Mensaje procesado para {sender_phone}: {len(full_response)} caracteres")
         
     except Exception as e:
         logger.error(f"❌ Error en handle_ds: {e}")
-        client.send_message(
-            sender_phone,
-            f"**❌ Error inesperado**\n\n"
-            f"{str(e)[:150]}\n\n"
-            f"*Usa `/new` para reiniciar la sesión.*"
-        )
+        try:
+            client.send_message(
+                sender_phone,
+                f"**❌ Error inesperado**\n\n{str(e)[:150]}\n\n*Usa `/new` para reiniciar la sesión.*"
+            )
+        except:
+            pass
 
 
 def handle_ds_help(client, message: dict):
@@ -638,8 +534,7 @@ def handle_ds_help(client, message: dict):
         f"• `ds ¿Cómo está el clima hoy?`\n"
         f"• `ds Explícame qué es la IA`\n\n"
         f"---\n\n"
-        f"*🔧 La sesión se mantiene activa hasta que la reinicies*\n"
-        f"*📝 AIDUS nunca genera código y siempre responde en español*"
+        f"*🔧 La sesión se mantiene activa hasta que la reinicies*"
     )
     
     try:
