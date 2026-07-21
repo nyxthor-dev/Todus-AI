@@ -408,10 +408,6 @@ def process_message(client: ToDusClient2, message: dict):
     try:
         if command == 'start':
             handle_start(client, message)
-        elif command == 'yt' or command.startswith('yt '):
-            handle_yt(client, message)
-        elif command == 'ythelp':
-            handle_yt_help(client, message)
         elif command == 'ds' or command.startswith('ds '):
             handle_ds(client, message)
         elif command == 'dshelp':
