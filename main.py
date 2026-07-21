@@ -412,7 +412,12 @@ def process_message(client: ToDusClient2, message: dict):
             handle_yt(client, message)
         elif command == 'ythelp':
             handle_yt_help(client, message)
+        elif command == 'ds' or command.startswith('ds '):
+    handle_ds(client, message)
+        elif command == 'dshelp':
+    handle_ds_help(client, message)
         else:
+
             # Comando no reconocido: ignorar silenciosamente
             pass
             
