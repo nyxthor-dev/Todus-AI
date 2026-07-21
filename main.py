@@ -36,10 +36,10 @@ from todus import ToDusClient2
 from todus.errors import AuthenticationError, ConnectionLostError
 from todus import util
 
-# Importar comandos y handlers
+#comandos
 from cmd import handle_start
 from cmd.yt import handle_yt, handle_yt_help
-from handlers.media import MediaHandler
+from cmd.ds import handle_ds, handle_ds_help
 
 # Importar Flask
 from flask import Flask, jsonify, request
