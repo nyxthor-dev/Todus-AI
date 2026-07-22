@@ -7,6 +7,7 @@ Bot de ToDus con soporte para:
 - Descarga de videos de YouTube con progreso en tiempo real
 - Chat con DeepSeek AI (AIDUS)
 - Manejo de mensajes multimedia entrantes
+- API Flask con endpoint /health para mantener el puerto abierto en Render
 """
 
 import os
@@ -15,6 +16,7 @@ import logging
 import signal
 import time
 import hashlib
+import threading
 from pathlib import Path
 
 # Cargar variables de entorno desde .env
@@ -28,6 +30,9 @@ except ImportError:
 sdk_path = Path(__file__).parent / "todus"
 if sdk_path.exists() and str(sdk_path.parent) not in sys.path:
     sys.path.insert(0, str(sdk_path.parent))
+
+# Importar Flask
+from flask import Flask, jsonify
 
 # Importar el cliente de ToDus
 from todus import ToDusClient2
@@ -51,11 +56,58 @@ logger = logging.getLogger(__name__)
 running = True
 media_handler = None
 BOT_JID = None
+bot_client = None
 
-# Control de duplicados - Usamos un conjunto con IDs de mensajes ya procesados
+# Control de duplicados
 processed_messages = set()
 MAX_PROCESSED = 1000
 
+# ============================================================
+# FLASK API
+# ============================================================
+
+app = Flask(__name__)
+
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Endpoint de salud para Render."""
+    status = {
+        'status': 'healthy',
+        'bot_running': running,
+        'bot_connected': bot_client is not None and bot_client.logged,
+        'phone': os.getenv('PHONE_NUMBER', 'not_set'),
+        'timestamp': time.time()
+    }
+    return jsonify(status)
+
+
+@app.route('/')
+def index():
+    """Página principal."""
+    return jsonify({
+        'name': 'ToDus Bot',
+        'version': '1.0.0',
+        'status': 'running',
+        'endpoints': {
+            '/health': 'Health check',
+            '/': 'This page'
+        }
+    })
+
+
+def run_flask():
+    """Ejecuta el servidor Flask en un puerto específico."""
+    port = int(os.getenv('PORT', 8080))
+    logger.info(f"🌐 Iniciando Flask API en el puerto {port}")
+    try:
+        app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+    except Exception as e:
+        logger.error(f"❌ Error en Flask: {e}")
+
+# ============================================================
+# FUNCIONES DEL BOT
+# ============================================================
 
 def signal_handler(sig, frame):
     """Maneja la señal de interrupción (Ctrl+C)."""
@@ -75,65 +127,48 @@ def is_own_message(message: dict) -> bool:
     if not sender:
         return False
     
-    # Extraer JID sin recurso
     sender_jid = sender.split('/')[0]
-    
-    # Si el remitente es el bot -> mensaje enviado por el bot
     return sender_jid == BOT_JID
 
 
 def get_message_unique_id(message: dict) -> str:
-    """
-    Genera un ID único para un mensaje.
-    PRIORIZA el ID del mensaje si existe.
-    """
-    # 1. ID del mensaje (más fiable)
+    """Genera un ID único para un mensaje."""
     msg_id = message.get('id', '')
     if msg_id:
         return f"id_{msg_id}"
     
-    # 2. Si no tiene ID, usar combinación de atributos
     sender = message.get('from', '')
     body = message.get('body', '')
     url = message.get('url', '')
     file_id = message.get('file_id', '')
     video_id = message.get('video_id', '')
     
-    # Para mensajes multimedia, usar la URL o ID del archivo
     if url:
         return hashlib.md5(f"{sender}:url:{url}".encode()).hexdigest()
     if file_id:
         return hashlib.md5(f"{sender}:file:{file_id}".encode()).hexdigest()
     if video_id:
         return hashlib.md5(f"{sender}:video:{video_id}".encode()).hexdigest()
-    
-    # 3. Fallback: combinar sender + body
     if body:
         return hashlib.md5(f"{sender}:body:{body}".encode()).hexdigest()
     
-    # 4. Último recurso: timestamp del mensaje
     timestamp = message.get('sent_at', time.time())
     return hashlib.md5(f"{sender}:{timestamp}".encode()).hexdigest()
 
 
 def is_duplicate(message: dict) -> bool:
-    """
-    Detecta si un mensaje ya fue procesado.
-    """
+    """Detecta si un mensaje ya fue procesado."""
     global processed_messages
     
     unique_id = get_message_unique_id(message)
     
-    # Si ya procesamos este mensaje, es duplicado
     if unique_id in processed_messages:
         logger.debug(f"⚠️ Mensaje duplicado ignorado: {unique_id[:20]}...")
         return True
     
-    # Marcar como procesado
     processed_messages.add(unique_id)
     logger.debug(f"✅ Mensaje registrado: {unique_id[:20]}...")
     
-    # Limitar el tamaño del conjunto
     if len(processed_messages) > MAX_PROCESSED:
         to_remove = list(processed_messages)[:MAX_PROCESSED // 2]
         for old_id in to_remove:
@@ -158,12 +193,11 @@ def handle_media_message(client: ToDusClient2, message: dict):
     raw = message.get('raw', '')
     body = message.get('body', '')
     
-    # Detectar tipo de multimedia
+    import re
+    
     media_type = "desconocido"
     file_name = "archivo"
     file_size = 0
-    
-    import re
     
     if '<image' in raw:
         media_type = "📷 Imagen"
@@ -228,20 +262,18 @@ def handle_media_message(client: ToDusClient2, message: dict):
 
 
 def process_message(client: ToDusClient2, message: dict):
-    """
-    Procesa un mensaje entrante.
-    """
+    """Procesa un mensaje entrante."""
     # 1. Ignorar mensajes del propio bot
     if is_own_message(message):
         logger.debug(f"Ignorando mensaje propio")
         return
     
-    # 2. Verificar duplicado ANTES de cualquier procesamiento
+    # 2. Verificar duplicado
     if is_duplicate(message):
         logger.debug(f"Mensaje duplicado ignorado")
         return
     
-    # 3. Verificar si es multimedia
+    # 3. Verificar multimedia
     raw = message.get('raw', '')
     is_media = any([
         '<file' in raw,
@@ -267,11 +299,9 @@ def process_message(client: ToDusClient2, message: dict):
     if not body:
         return
     
-    # 5. Ignorar mensajes de grupos
     if message.get('is_group'):
         return
     
-    # 6. Extraer remitente
     sender = message.get('from', '')
     if not sender:
         return
@@ -279,12 +309,10 @@ def process_message(client: ToDusClient2, message: dict):
     sender_phone = sender.split('@')[0]
     logger.info(f"Mensaje de {sender_phone}: {body}")
     
-    # 7. Normalizar comando
     command = body.lower().strip()
     if command.startswith('!'):
         command = command[1:]
     
-    # 8. Procesar comandos
     try:
         if command == 'start':
             handle_start(client, message)
@@ -297,7 +325,6 @@ def process_message(client: ToDusClient2, message: dict):
         elif command == 'dshelp':
             handle_ds_help(client, message)
         else:
-            # Comando no reconocido: ignorar
             pass
             
     except Exception as e:
@@ -311,47 +338,39 @@ def process_message(client: ToDusClient2, message: dict):
             pass
 
 
-def main():
-    """Función principal del bot."""
-    global running, media_handler, BOT_JID
+def run_bot():
+    """Ejecuta el bot de ToDus."""
+    global running, media_handler, BOT_JID, bot_client
     
-    # Obtener credenciales
     phone = os.getenv('PHONE_NUMBER')
     password = os.getenv('PASSWORD')
     
     if not phone or not password:
         logger.error("❌ Error: PHONE_NUMBER y PASSWORD deben estar configurados en .env")
-        logger.error("📝 Crea un archivo .env con:")
-        logger.error("PHONE_NUMBER=5300000000")
-        logger.error("PASSWORD=tu_contraseña")
-        sys.exit(1)
+        return
     
     logger.info(f"🚀 Iniciando bot para {phone}")
     
-    # Crear el cliente
     client = ToDusClient2(
         phone_number=phone,
         password=password,
         verify_ssl=False,
     )
     
-    # Guardar JID del bot
+    bot_client = client
     BOT_JID = util.build_jid(phone)
     logger.info(f"🤖 JID del bot: {BOT_JID}")
     
-    # Inicializar el manejador de medios
     media_handler = MediaHandler(client, download_folder="downloads")
     
-    # Registrar el manejador de mensajes en el EventBus
     client.events.on('message')(lambda event: process_message(client, event))
     
     try:
-        # Iniciar sesión
         logger.info("🔐 Iniciando sesión...")
         client.login()
         logger.info("✅ Sesión iniciada correctamente!")
         logger.info(f"📱 Teléfono: {phone}")
-        logger.info("👂 Escuchando mensajes... (presiona Ctrl+C para detener)")
+        logger.info("👂 Escuchando mensajes...")
         logger.info("")
         logger.info("📌 Comandos disponibles:")
         logger.info("  • start - Mensaje de bienvenida")
@@ -362,29 +381,34 @@ def main():
         logger.info("📷 También puedo recibir imágenes, vídeos y archivos")
         logger.info("")
         
-        # Manejar señales
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
         
-        # Iniciar escucha (bloqueante)
         client.listen_messages(client.token, lambda msg: None)
         
     except AuthenticationError as e:
         logger.error(f"❌ Error de autenticación: {e}")
-        logger.error("   Verifica que el número y la contraseña sean correctos.")
-        sys.exit(1)
     except ConnectionLostError as e:
         logger.error(f"❌ Conexión perdida: {e}")
-        sys.exit(1)
     except KeyboardInterrupt:
         logger.info("👋 Bot detenido por el usuario.")
-        sys.exit(0)
     except Exception as e:
         logger.exception(f"❌ Error inesperado: {e}")
-        sys.exit(1)
     finally:
         logger.info("👋 Bot detenido.")
 
 
+# ============================================================
+# MAIN
+# ============================================================
+
 if __name__ == "__main__":
-    main()
+    # Iniciar el bot en un hilo separado
+    bot_thread = threading.Thread(target=run_bot, daemon=True)
+    bot_thread.start()
+    
+    # Esperar un momento para que el bot inicie
+    time.sleep(2)
+    
+    # Iniciar Flask (bloquea el hilo principal, mantiene el puerto abierto)
+    run_flask()
