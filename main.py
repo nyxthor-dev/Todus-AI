@@ -8,6 +8,7 @@ Bot de ToDus con soporte para:
 - Chat con DeepSeek AI (AIDUS)
 - Manejo de mensajes multimedia entrantes
 - API Flask con endpoint /health para mantener el puerto abierto en Render
+- Anti-spam mejorado con detección de mensajes offline
 """
 
 import os
@@ -17,6 +18,8 @@ import signal
 import time
 import hashlib
 import threading
+from collections import deque
+from datetime import datetime, timedelta
 from pathlib import Path
 
 # Cargar variables de entorno desde .env
@@ -52,15 +55,177 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Variables globales
+# ============================================================
+# VARIABLES GLOBALES
+# ============================================================
+
 running = True
 media_handler = None
 BOT_JID = None
 bot_client = None
 
-# Control de duplicados
-processed_messages = set()
-MAX_PROCESSED = 1000
+# ============================================================
+# ANTI-SPAM MEJORADO
+# ============================================================
+
+class AntiSpamManager:
+    """
+    Sistema anti-spam mejorado con:
+    - Cache de IDs de mensajes (detecta offline duplicates)
+    - Limitador de frecuencia por usuario
+    - Limpieza automática
+    """
+    
+    def __init__(self, max_messages: int = 1000, cooldown_seconds: int = 3):
+        """
+        Args:
+            max_messages: Máximo de mensajes en caché
+            cooldown_seconds: Segundos entre mensajes del mismo usuario
+        """
+        self.max_messages = max_messages
+        self.cooldown_seconds = cooldown_seconds
+        
+        # Cache de IDs de mensajes procesados
+        self.processed_ids = set()
+        # Cache temporal para mensajes recientes (para detección de offline spam)
+        self.recent_ids = deque(maxlen=200)
+        
+        # Control de frecuencia por usuario
+        self.user_last_message = {}  # {user_id: timestamp}
+        self.user_message_count = {}  # {user_id: count}
+        
+        # Estadísticas
+        self.stats = {
+            'total_processed': 0,
+            'duplicates_blocked': 0,
+            'rate_limited_blocked': 0,
+            'offline_spam_blocked': 0,
+            'last_cleanup': time.time()
+        }
+        
+        logger.info("🛡️ Anti-Spam Manager inicializado")
+    
+    def _cleanup(self):
+        """Limpia cachés antiguos para evitar memory leak."""
+        now = time.time()
+        
+        # Limpiar cada 5 minutos
+        if now - self.stats['last_cleanup'] > 300:
+            # Limpiar processed_ids si excede el límite
+            if len(self.processed_ids) > self.max_messages:
+                # Convertir a lista, eliminar la mitad más antigua
+                old_ids = list(self.processed_ids)[:self.max_messages // 2]
+                for old_id in old_ids:
+                    self.processed_ids.discard(old_id)
+                logger.debug(f"🧹 Limpiados {len(old_ids)} mensajes antiguos de processed_ids")
+            
+            # Limpiar user_last_message (eliminar usuarios inactivos > 1 hora)
+            inactive_users = [
+                user for user, ts in self.user_last_message.items()
+                if now - ts > 3600
+            ]
+            for user in inactive_users:
+                self.user_last_message.pop(user, None)
+                self.user_message_count.pop(user, None)
+            
+            if inactive_users:
+                logger.debug(f"🧹 Limpiados {len(inactive_users)} usuarios inactivos")
+            
+            self.stats['last_cleanup'] = now
+    
+    def is_duplicate_id(self, msg_id: str) -> bool:
+        """
+        Verifica si un ID de mensaje ya fue procesado.
+        Útil para detectar mensajes offline que ToDus reenvía.
+        """
+        if not msg_id:
+            return False
+        
+        # Verificar en caché principal
+        if msg_id in self.processed_ids:
+            self.stats['offline_spam_blocked'] += 1
+            logger.debug(f"🔄 Mensaje offline detectado (ID: {msg_id[:20]}...)")
+            return True
+        
+        # Verificar en caché reciente (para mensajes duplicados rápidos)
+        if msg_id in self.recent_ids:
+            self.stats['duplicates_blocked'] += 1
+            logger.debug(f"⚠️ Mensaje duplicado reciente (ID: {msg_id[:20]}...)")
+            return True
+        
+        return False
+    
+    def register_message(self, msg_id: str, user_id: str):
+        """
+        Registra un mensaje como procesado.
+        """
+        if msg_id:
+            # Agregar a cachés
+            self.processed_ids.add(msg_id)
+            self.recent_ids.append(msg_id)
+            
+            # Limpiar si es necesario
+            self._cleanup()
+        
+        # Actualizar estadísticas del usuario
+        if user_id:
+            self.user_last_message[user_id] = time.time()
+            self.user_message_count[user_id] = self.user_message_count.get(user_id, 0) + 1
+        
+        self.stats['total_processed'] += 1
+    
+    def is_rate_limited(self, user_id: str) -> bool:
+        """
+        Verifica si un usuario está enviando demasiados mensajes.
+        """
+        if not user_id:
+            return False
+        
+        now = time.time()
+        last_time = self.user_last_message.get(user_id, 0)
+        
+        # Si el usuario no ha enviado mensajes antes, no está limitado
+        if last_time == 0:
+            return False
+        
+        # Verificar cooldown
+        if now - last_time < self.cooldown_seconds:
+            self.stats['rate_limited_blocked'] += 1
+            logger.debug(f"⏱️ Rate limit para {user_id}: {now - last_time:.2f}s desde último mensaje")
+            return True
+        
+        return False
+    
+    def get_stats(self) -> dict:
+        """Obtiene estadísticas del anti-spam."""
+        return {
+            **self.stats,
+            'cache_size': len(self.processed_ids),
+            'recent_size': len(self.recent_ids),
+            'active_users': len(self.user_last_message),
+            'cooldown_seconds': self.cooldown_seconds,
+            'max_messages': self.max_messages
+        }
+    
+    def reset(self):
+        """Reinicia todas las cachés."""
+        self.processed_ids.clear()
+        self.recent_ids.clear()
+        self.user_last_message.clear()
+        self.user_message_count.clear()
+        self.stats = {
+            'total_processed': 0,
+            'duplicates_blocked': 0,
+            'rate_limited_blocked': 0,
+            'offline_spam_blocked': 0,
+            'last_cleanup': time.time()
+        }
+        logger.info("🔄 Anti-Spam Manager reiniciado")
+
+
+# Instancia global del anti-spam
+anti_spam = AntiSpamManager(max_messages=2000, cooldown_seconds=2)
+
 
 # ============================================================
 # FLASK API
@@ -70,6 +235,7 @@ app = Flask(__name__)
 
 
 @app.route('/health', methods=['GET'])
+@app.route('/api/health', methods=['GET'])  # 🔥 Alias para compatibilidad
 def health_check():
     """Endpoint de salud para Render."""
     status = {
@@ -77,9 +243,23 @@ def health_check():
         'bot_running': running,
         'bot_connected': bot_client is not None and bot_client.logged,
         'phone': os.getenv('PHONE_NUMBER', 'not_set'),
-        'timestamp': time.time()
+        'timestamp': time.time(),
+        'anti_spam': anti_spam.get_stats()
     }
     return jsonify(status)
+
+
+@app.route('/anti-spam/stats', methods=['GET'])
+def anti_spam_stats():
+    """Endpoint para ver estadísticas del anti-spam."""
+    return jsonify(anti_spam.get_stats())
+
+
+@app.route('/anti-spam/reset', methods=['POST'])
+def anti_spam_reset():
+    """Endpoint para reiniciar el anti-spam."""
+    anti_spam.reset()
+    return jsonify({'status': 'reset', 'message': 'Anti-Spam reiniciado'})
 
 
 @app.route('/')
@@ -91,19 +271,23 @@ def index():
         'status': 'running',
         'endpoints': {
             '/health': 'Health check',
+            '/api/health': 'Health check (alias)',
+            '/anti-spam/stats': 'Anti-spam statistics',
+            '/anti-spam/reset': 'Reset anti-spam (POST)',
             '/': 'This page'
         }
     })
 
 
 def run_flask():
-    """Ejecuta el servidor Flask en un puerto específico."""
+    """Ejecuta el servidor Flask."""
     port = int(os.getenv('PORT', 8080))
     logger.info(f"🌐 Iniciando Flask API en el puerto {port}")
     try:
         app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
     except Exception as e:
         logger.error(f"❌ Error en Flask: {e}")
+
 
 # ============================================================
 # FUNCIONES DEL BOT
@@ -132,11 +316,16 @@ def is_own_message(message: dict) -> bool:
 
 
 def get_message_unique_id(message: dict) -> str:
-    """Genera un ID único para un mensaje."""
+    """
+    Genera un ID único para un mensaje.
+    PRIORIZA el ID del mensaje si existe (para detectar offline spam).
+    """
+    # 1. ID del mensaje (más fiable para offline spam)
     msg_id = message.get('id', '')
     if msg_id:
         return f"id_{msg_id}"
     
+    # 2. Si no tiene ID, usar combinación de atributos
     sender = message.get('from', '')
     body = message.get('body', '')
     url = message.get('url', '')
@@ -152,30 +341,113 @@ def get_message_unique_id(message: dict) -> str:
     if body:
         return hashlib.md5(f"{sender}:body:{body}".encode()).hexdigest()
     
+    # 3. Último recurso: timestamp
     timestamp = message.get('sent_at', time.time())
     return hashlib.md5(f"{sender}:{timestamp}".encode()).hexdigest()
 
 
-def is_duplicate(message: dict) -> bool:
-    """Detecta si un mensaje ya fue procesado."""
+def extract_user_id(message: dict) -> str:
+    """Extrae el ID del usuario del mensaje."""
+    sender = message.get('from', '')
+    if not sender:
+        return ''
+    return sender.split('/')[0]
+
+
+def process_message(client: ToDusClient2, message: dict):
+    """
+    Procesa un mensaje entrante con anti-spam mejorado.
+    """
     global processed_messages
     
+    # 1. Ignorar mensajes del propio bot
+    if is_own_message(message):
+        logger.debug("Ignorando mensaje propio")
+        return
+    
+    # 2. Extraer información del mensaje
+    msg_id = message.get('id', '')
     unique_id = get_message_unique_id(message)
+    user_id = extract_user_id(message)
     
-    if unique_id in processed_messages:
-        logger.debug(f"⚠️ Mensaje duplicado ignorado: {unique_id[:20]}...")
-        return True
+    # 3. Verificar si es un mensaje offline duplicado (mismo ID)
+    if anti_spam.is_duplicate_id(msg_id):
+        logger.warning(f"🔄 Mensaje offline/duplicado ignorado (ID: {msg_id[:20] if msg_id else 'sin_id'})")
+        return
     
-    processed_messages.add(unique_id)
-    logger.debug(f"✅ Mensaje registrado: {unique_id[:20]}...")
+    # 4. Verificar rate limit por usuario
+    if anti_spam.is_rate_limited(user_id):
+        logger.warning(f"⏱️ Rate limit excedido para {user_id}")
+        return
     
-    if len(processed_messages) > MAX_PROCESSED:
-        to_remove = list(processed_messages)[:MAX_PROCESSED // 2]
-        for old_id in to_remove:
-            processed_messages.discard(old_id)
-        logger.debug(f"🧹 Limpiados {len(to_remove)} mensajes antiguos del caché")
+    # 5. Registrar mensaje como procesado
+    anti_spam.register_message(msg_id, user_id)
     
-    return False
+    # 6. Verificar si es multimedia
+    raw = message.get('raw', '')
+    is_media = any([
+        '<file' in raw,
+        '<image' in raw, 
+        '<video' in raw,
+        '<sticker' in raw,
+        '<contact' in raw,
+        '<location' in raw,
+        '<event' in raw,
+        message.get('url'),
+        message.get('file_id'),
+        message.get('video_url'),
+        message.get('sticker_id'),
+    ])
+    
+    if is_media:
+        logger.info(f"📷 Mensaje multimedia detectado")
+        handle_media_message(client, message)
+        return
+    
+    # 7. Procesar mensajes de texto
+    body = message.get('body', '').strip()
+    if not body:
+        return
+    
+    if message.get('is_group'):
+        return
+    
+    if not user_id:
+        return
+    
+    sender_phone = user_id.split('@')[0]
+    logger.info(f"Mensaje de {sender_phone}: {body[:50]}...")
+    
+    # 8. Normalizar comando
+    command = body.lower().strip()
+    if command.startswith('!'):
+        command = command[1:]
+    
+    # 9. Procesar comandos
+    try:
+        if command == 'start':
+            handle_start(client, message)
+        elif command == 'yt' or command.startswith('yt '):
+            handle_yt(client, message)
+        elif command == 'ythelp':
+            handle_yt_help(client, message)
+        elif command == 'ds' or command.startswith('ds '):
+            handle_ds(client, message)
+        elif command == 'dshelp':
+            handle_ds_help(client, message)
+        else:
+            # Comando no reconocido: ignorar
+            pass
+            
+    except Exception as e:
+        logger.error(f"Error procesando comando {command}: {e}")
+        try:
+            client.send_message(
+                sender_phone,
+                f"❌ Error al procesar el comando: {str(e)[:100]}"
+            )
+        except:
+            pass
 
 
 def handle_media_message(client: ToDusClient2, message: dict):
@@ -261,83 +533,6 @@ def handle_media_message(client: ToDusClient2, message: dict):
         logger.error(f"❌ Error respondiendo a multimedia: {e}")
 
 
-def process_message(client: ToDusClient2, message: dict):
-    """Procesa un mensaje entrante."""
-    # 1. Ignorar mensajes del propio bot
-    if is_own_message(message):
-        logger.debug(f"Ignorando mensaje propio")
-        return
-    
-    # 2. Verificar duplicado
-    if is_duplicate(message):
-        logger.debug(f"Mensaje duplicado ignorado")
-        return
-    
-    # 3. Verificar multimedia
-    raw = message.get('raw', '')
-    is_media = any([
-        '<file' in raw,
-        '<image' in raw, 
-        '<video' in raw,
-        '<sticker' in raw,
-        '<contact' in raw,
-        '<location' in raw,
-        '<event' in raw,
-        message.get('url'),
-        message.get('file_id'),
-        message.get('video_url'),
-        message.get('sticker_id'),
-    ])
-    
-    if is_media:
-        logger.info(f"📷 Mensaje multimedia detectado")
-        handle_media_message(client, message)
-        return
-    
-    # 4. Procesar mensajes de texto
-    body = message.get('body', '').strip()
-    if not body:
-        return
-    
-    if message.get('is_group'):
-        return
-    
-    sender = message.get('from', '')
-    if not sender:
-        return
-    
-    sender_phone = sender.split('@')[0]
-    logger.info(f"Mensaje de {sender_phone}: {body}")
-    
-    command = body.lower().strip()
-    if command.startswith('!'):
-        command = command[1:]
-    
-    try:
-        if command == 'start':
-            handle_start(client, message)
-        elif command == 'yt' or command.startswith('yt '):
-            handle_yt(client, message)
-        elif command == 'ythelp':
-            handle_yt_help(client, message)
-        elif command == 'ds' or command.startswith('ds '):
-            handle_ds(client, message)
-        elif command == 'dshelp':
-            handle_ds_help(client, message)
-        else:
-            pass
-            
-    except Exception as e:
-        logger.error(f"Error procesando comando {command}: {e}")
-        try:
-            client.send_message(
-                sender_phone,
-                f"❌ Error al procesar el comando: {str(e)[:100]}"
-            )
-        except:
-            pass
-
-
 def run_bot():
     """Ejecuta el bot de ToDus."""
     global running, media_handler, BOT_JID, bot_client
@@ -380,10 +575,12 @@ def run_bot():
         logger.info("")
         logger.info("📷 También puedo recibir imágenes, vídeos y archivos")
         logger.info("")
+        logger.info(f"🛡️ Anti-Spam: Cooldown={anti_spam.cooldown_seconds}s, MaxCache={anti_spam.max_messages}")
+        logger.info("")
         
-        signal.signal(signal.SIGINT, signal_handler)
-        signal.signal(signal.SIGTERM, signal_handler)
+        # ⚠️ NO llamamos a signal.signal aquí porque estamos en un hilo secundario
         
+        # Bucle principal - escuchar mensajes
         client.listen_messages(client.token, lambda msg: None)
         
     except AuthenticationError as e:
@@ -399,10 +596,14 @@ def run_bot():
 
 
 # ============================================================
-# MAIN
+# MAIN - Hilo principal
 # ============================================================
 
 if __name__ == "__main__":
+    # Registrar manejadores de señales en el hilo principal
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
     # Iniciar el bot en un hilo separado
     bot_thread = threading.Thread(target=run_bot, daemon=True)
     bot_thread.start()
