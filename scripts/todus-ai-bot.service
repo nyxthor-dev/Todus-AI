@@ -1,0 +1,20 @@
+[Unit]
+Description=NyxBot - toDus + IA
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# AJUSTA estas rutas al usuario y carpeta de tu VPS:
+User=root
+WorkingDirectory=/opt/todus-ai-bot
+ExecStart=/usr/bin/python3 /opt/todus-ai-bot/main.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/opt/todus-ai-bot/logs/bot.log
+StandardError=append:/opt/todus-ai-bot/logs/bot.log
+# Cargar variables de entorno desde .env
+EnvironmentFile=/opt/todus-ai-bot/.env
+
+[Install]
+WantedBy=multi-user.target
